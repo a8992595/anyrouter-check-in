@@ -19,6 +19,7 @@ import httpx
 from cloakbrowser import launch_async
 from dotenv import load_dotenv
 
+from utils.agentrouter_oauth import run_agentrouter_oauth
 from utils.browser import (
 	BrowserLoginResult,
 	has_session_cookie,
@@ -361,6 +362,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
+	if account.provider == 'agentrouter' and not provider_config.needs_manual_check_in():
+		return await run_agentrouter_oauth(account_name, account.api_user, provider_config)
 
 	# 邮箱密码优先
 	all_cookies = None
@@ -521,8 +524,17 @@ async def main():
 				success_count += 1
 
 			should_notify_this_account = False
+			oauth_message = user_info_after.get('check_in_message') if user_info_after else None
+			if oauth_message:
+				account_name = account.get_display_name(i)
+				status = '[SUCCESS]' if success else '[FAIL]'
+				notice = f'{status} {account_name}\n{oauth_message}'
+				if user_info_after.get('success'):
+					notice += f'\n{user_info_after["display"]}'
+				notification_content.append(notice)
+				need_notify = True
 
-			if not success:
+			if not success and not oauth_message:
 				should_notify_this_account = True
 				need_notify = True
 				account_name = account.get_display_name(i)

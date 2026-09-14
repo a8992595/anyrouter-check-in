@@ -262,7 +262,7 @@
   - `sign_in_path: "/api/user/sign_in"`
 - `agentrouter`：
   - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
-  - `sign_in_path: null`（查询用户信息时自动签到）
+  - `sign_in_path: null`（使用 GitHub 或 Linux DO OAuth 重新登录，按回调 `checked_in` 确认奖励）
   - `use_proxy: true`
 
 **重要提示**：
@@ -271,6 +271,32 @@
 - 自定义的 provider 配置会覆盖同名的默认配置
 
 ## 代理配置（可选）
+
+### Agentrouter 的第三方登录态
+
+Agentrouter 查询余额不等于签到。内置 Agentrouter 现在通过浏览器重新完成 GitHub / Linux DO OAuth 登录，并且只在回调用户 ID 与账号的 `api_user` 一致、`success=true`、`checked_in=true` 时计为签到成功。没有奖励确认、登录过期或 Cloudflare/验证码阻拦会明确报告，不会阻断其他账号。
+
+保留 `ANYROUTER_ACCOUNTS` 原有各账号配置，包括 Anyrouter。新增 production Environment Secret：
+
+不要删除原有 Agentrouter 项的 `cookies` 和 `api_user` 字段：它们保留以兼容原配置校验；OAuth 流程实际使用新 Secret 中的第三方 Cookies，不使用旧的 Agentrouter session。
+
+`AGENTROUTER_OAUTH_STATES`
+
+格式如下（请用 `scripts/export_agentrouter_state.py` 导出，不要把真实值提交到仓库）：
+
+```json
+{"version":1,"accounts":{"Agentrouter账号的api_user":{"provider":"github","cookies":[]},"另一个Agentrouter账号的api_user":{"provider":"linuxdo","cookies":[]}}}
+```
+
+`provider` 在这个新 Secret 中表示第三方登录方式，只能为 `github` 或 `linuxdo`；`ANYROUTER_ACCOUNTS` 中的 `provider` 仍然是 `agentrouter`，不用改成第三方名称。导出的 Cookies 来自第三方登录网站，不是 Agentrouter 的 session，也不是 GitHub PAT。
+
+本地导出工具读取已登录的独立浏览器配置，离线运行并仅复制到剪贴板。可用 `AGENTROUTER_PROFILE_ROOT` 指定配置根目录，该目录应包含 `github`、`linuxdo` 子目录；Windows 使用已安装的 Edge。导出前先关闭使用这些配置的测试浏览器。填入对应 Agentrouter `api_user`，依次添加账号后一次性复制到 Secret。新增账号或更新登录态时保留其他账号条目。
+
+现有 `PROXY_SUBSCRIPTION_URL` 保留。Actions 会把第三方登录态装入一次性的浏览器上下文，不写入浏览器 Profile 缓存或调试截图。更换机器或出口 IP 后，GitHub / Linux DO 可能要求重新验证；这种情况下需要人工重新登录并更新 Secret，不能保证绕过第三方验证。
+
+OAuth 响应的额度字段可能为 0 占位；脚本只显示后续用户信息请求得到的真实余额，不伪造“签到前”数据或奖励金额。即使后续余额请求失败，已取得的 `checked_in=true` 仍会单独通知。成功至少一个账号时仍沿用原工作流退出码 0，需看每个账号的通知，不能以 Actions 绿勾认定所有账号到账。
+
+Anyrouter 的签到接口、Cookie 处理、余额前后对比、定时任务和原有 Secrets 不变。
 
 内置的 `agentrouter` 默认 `use_proxy: true`。如果你的运行环境访问该平台不稳定，可以在 GitHub Actions 中配置 mihomo 订阅代理。
 
