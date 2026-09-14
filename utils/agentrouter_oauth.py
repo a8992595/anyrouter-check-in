@@ -13,6 +13,102 @@ ORIGIN = 'https://agentrouter.org'
 LOGIN_METHODS = {'github': ('GitHub', r'github'), 'linuxdo': ('Linux DO', r'linux\s*do')}
 
 
+class OAuthDiagnostics:
+	"""Record only fixed endpoint labels, status codes and boolean page signals."""
+
+	def __init__(self, context):
+		self.context = context
+		self.stage = 'open_agentrouter_login'
+		self.events = []
+		context.on('response', self.response)
+		context.on('requestfailed', self.request_failed)
+
+	@staticmethod
+	def endpoint(url):
+		try:
+			parsed = urlsplit(url)
+		except ValueError:
+			return {'site': 'other', 'route': 'other'}
+		sites = {'agentrouter.org', 'connect.linux.do', 'linux.do', 'github.com', 'challenges.cloudflare.com'}
+		paths = {
+			'/',
+			'/login',
+			'/auth/login',
+			'/oauth2/authorize',
+			'/api/oauth/state',
+			'/api/oauth/linuxdo',
+			'/api/oauth/github',
+			'/login/oauth/authorize',
+		}
+		return {
+			'site': parsed.hostname if parsed.hostname in sites else 'other',
+			'route': parsed.path if parsed.path in paths else 'other',
+		}
+
+	def response(self, response):
+		point = self.endpoint(response.url)
+		if response.request.resource_type != 'document' and point['route'] not in (
+			'/api/oauth/state',
+			'/api/oauth/linuxdo',
+			'/api/oauth/github',
+		):
+			return
+		self.events.append(
+			{**point, 'status': response.status, 'cf_challenge': response.headers.get('cf-mitigated') == 'challenge'}
+		)
+		self.events = self.events[-20:]
+
+	def request_failed(self, request):
+		point = self.endpoint(request.url)
+		if request.resource_type != 'document' and point['route'] not in (
+			'/api/oauth/state',
+			'/api/oauth/linuxdo',
+			'/api/oauth/github',
+		):
+			return
+		failure = request.failure or ''
+		known = (
+			'ERR_PROXY_CONNECTION_FAILED',
+			'ERR_TUNNEL_CONNECTION_FAILED',
+			'ERR_CONNECTION_REFUSED',
+			'ERR_NAME_NOT_RESOLVED',
+			'ERR_TIMED_OUT',
+			'ERR_CONNECTION_RESET',
+			'ERR_CERT_AUTHORITY_INVALID',
+			'ERR_ABORTED',
+		)
+		code = next((code for code in known if failure == 'net::' + code), 'OTHER_NETWORK_ERROR')
+		self.events.append({**point, 'network_error': code})
+		self.events = self.events[-20:]
+
+	async def dump(self):
+		pages = []
+		for page in self.context.pages[-5:]:
+			point = self.endpoint(page.url)
+			try:
+				signals = await asyncio.wait_for(
+					page.evaluate("""() => ({
+					cf_challenge: !!document.querySelector('#challenge-running, #challenge-stage') || typeof window._cf_chl_opt !== 'undefined',
+					password_input: [...document.querySelectorAll('input[type=password]')].some(e => e.getClientRects().length > 0),
+					authorize_button: [...document.querySelectorAll('button')].some(e => e.getClientRects().length > 0 && /^(授权|允许|Authorize|Allow)$/i.test(e.textContent.trim())),
+					linuxdo_button: [...document.querySelectorAll('button')].some(e => e.getClientRects().length > 0 && /linux\\s*do/i.test(e.textContent)),
+					turnstile_frame: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+				})"""),
+					timeout=0.6,
+				)
+				pages.append({**point, **signals})
+			except Exception:
+				pages.append({**point, 'page_signals': 'unavailable'})
+		print(
+			'[OAUTH_DIAG] '
+			+ json.dumps({'stage': self.stage, 'events': self.events, 'pages': pages}, ensure_ascii=True)
+		)
+
+	def close(self):
+		self.context.remove_listener('response', self.response)
+		self.context.remove_listener('requestfailed', self.request_failed)
+
+
 def oauth_cookies(cookies, method):
 	"""Filter only the chosen identity provider; never export Agentrouter sessions."""
 	if method not in LOGIN_METHODS:
@@ -93,6 +189,7 @@ async def perform_oauth(context, api_user, method='github', timeout=90):
 	"""Use fresh context with third-party-only state; return a redacted result."""
 	future = asyncio.get_running_loop().create_future()
 	tasks = set()
+	diagnostic = OAuthDiagnostics(context) if method == 'linuxdo' else None
 
 	async def inspect(response):
 		parsed = urlsplit(response.url)
@@ -104,6 +201,8 @@ async def perform_oauth(context, api_user, method='github', timeout=90):
 			payload = None
 		verdict = classify_callback(response.url, response.status, payload, api_user, method)
 		if verdict is not None and not future.done():
+			if diagnostic:
+				diagnostic.stage = 'oauth_callback_received'
 			future.set_result((verdict, response.frame.page))
 
 	def on_response(response):
@@ -116,7 +215,11 @@ async def perform_oauth(context, api_user, method='github', timeout=90):
 	async def navigate():
 		page = await context.new_page()
 		await page.goto(ORIGIN + '/login', wait_until='domcontentloaded', timeout=45000)
+		if diagnostic:
+			diagnostic.stage = 'click_linuxdo_button'
 		await page.get_by_role('button', name=re.compile(LOGIN_METHODS[method][1], re.I)).first.click(timeout=20000)
+		if diagnostic:
+			diagnostic.stage = 'waiting_for_oauth_callback'
 		while not future.done():
 			# Previously approved grants usually redirect automatically. Only click the
 			# standard consent button on GitHub's own OAuth authorization page.
@@ -136,6 +239,8 @@ async def perform_oauth(context, api_user, method='github', timeout=90):
 						'button', name=re.compile(r'^(授权|允许|Authorize|Allow)$', re.I)
 					).first
 					if await button.is_visible():
+						if diagnostic:
+							diagnostic.stage = 'click_linuxdo_authorize'
 						await button.click(timeout=3000)
 			await asyncio.sleep(0.25)
 		return future.result()
@@ -172,8 +277,22 @@ async def perform_oauth(context, api_user, method='github', timeout=90):
 					after['display'] = f'余额: ${after["quota"]:.2f} | 累计消耗: ${after["used_quota"]:.2f}'
 			except Exception:
 				after['check_in_message'] += ' 余额暂时读取失败，未用 OAuth 占位余额代替。'
+		if diagnostic and not verdict['confirmed']:
+			try:
+				await diagnostic.dump()
+			except Exception:
+				print('[OAUTH_DIAG] unavailable')
 		return verdict['confirmed'], None, after
+	except Exception:
+		if diagnostic:
+			try:
+				await diagnostic.dump()
+			except Exception:
+				print('[OAUTH_DIAG] unavailable')
+		raise
 	finally:
+		if diagnostic:
+			diagnostic.close()
 		context.remove_listener('response', on_response)
 		for task in tuple(tasks):
 			task.cancel()
@@ -210,6 +329,10 @@ async def run_agentrouter_oauth(account_name, api_user, provider):
 		return result
 	except Exception as exc:
 		# Driver errors can embed cookies, request bodies and OAuth codes.
+		if method == 'linuxdo':
+			return failure(
+				f'OAuth 未完成（{type(exc).__name__}）。请查看本次日志中的 [OAUTH_DIAG] 实测记录；当前不能确定失败原因。'
+			)
 		return failure(
 			f'OAuth 未完成（{type(exc).__name__}）。请检查代理或重新导出登录态；Cloudflare/验证码/重新登录需要人工处理。'
 		)
